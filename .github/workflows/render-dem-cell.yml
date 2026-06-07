@@ -50,7 +50,9 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            gdal-bin python3-gdal sqlite3 awscli curl
+            gdal-bin python3-gdal sqlite3 curl
+          # aws CLI v2 is preinstalled on ubuntu-latest runners; verify
+          aws --version
 
       - name: Install rclone
         run: |
