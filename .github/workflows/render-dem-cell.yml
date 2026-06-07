@@ -1,0 +1,109 @@
+name: Render DEM cell
+
+# Triggered by:
+#   - Cloudflare Worker via repository_dispatch (event_type=render-cell, payload.cell)
+#   - Manual via workflow_dispatch for one-off rendering / debugging
+#
+# Output: PMTiles file at r2://argiants-tiles/dem/<cell>-<sha[:12]>.pmtiles
+# Sentinel: r2://argiants-tiles/dem/_pending/<cell>.json tracks state through job
+
+on:
+  repository_dispatch:
+    types: [render-cell]
+  workflow_dispatch:
+    inputs:
+      cell:
+        description: "Cell name (e.g. N4225_E01850)"
+        required: true
+        type: string
+
+# Avoid concurrent renders of the same cell. If a second render starts for the
+# same cell, queue it (don't cancel) so the first finishes the upload.
+concurrency:
+  group: render-${{ github.event.client_payload.cell || github.event.inputs.cell }}
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CELL: ${{ github.event.client_payload.cell || github.event.inputs.cell }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET: argiants-tiles
+      R2_DEM_PREFIX: dem
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate cell name
+        run: |
+          if ! [[ "$CELL" =~ ^[NS][0-9]{4}_[EW][0-9]{5}$ ]]; then
+            echo "::error::Invalid cell name: '$CELL'"
+            exit 1
+          fi
+          chmod +x scripts/*.sh
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gdal-bin python3-gdal sqlite3 awscli curl
+
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash >/dev/null
+
+      - name: Install go-pmtiles
+        run: |
+          # Pin to a known-good release. Update annually.
+          VER=1.22.1
+          curl -fsSL -o /tmp/pmtiles.tar.gz \
+            "https://github.com/protomaps/go-pmtiles/releases/download/v${VER}/go-pmtiles_${VER}_Linux_x86_64.tar.gz"
+          tar -C /tmp -xzf /tmp/pmtiles.tar.gz pmtiles
+          sudo mv /tmp/pmtiles /usr/local/bin/pmtiles
+          pmtiles version
+
+      - name: Install rio-rgbify (patched)
+        run: |
+          # rio-rgbify 0.3.2 has two known incompatibilities with modern stack;
+          # both are fixed in-place by sed BEFORE first import.
+          # (See tech/CLAUDE.md memory pmtiles_day1_upstream_tooling_traps_2026_05_22)
+          pip install --quiet 'rasterio<1.4' 'numpy<2'
+          pip install --quiet rio-rgbify==0.3.2
+          RGB_DIR=$(python3 -c "import rio_rgbify, os; print(os.path.dirname(rio_rgbify.__file__))")
+          # Trap 1: PROJ 9.x rejects densify_pts=0
+          grep -l "densify_pts=0" "$RGB_DIR"/*.py | xargs -r sed -i 's/densify_pts=0/densify_pts=21/g'
+          # Trap 2: rasterio 1.3 rejects legacy PROJ4 dict syntax for dst_crs
+          grep -lE "dst_crs=\"init=['\"]epsg" "$RGB_DIR"/*.py | xargs -r sed -i -E "s/dst_crs=\"init=['\"]epsg:([0-9]+)['\"]?\"/dst_crs=\"EPSG:\1\"/g"
+          rio --version
+
+      - name: Write sentinel state=rendering
+        run: bash scripts/sentinel.sh write "$CELL" rendering
+
+      - name: Render cell
+        id: render
+        run: |
+          bash scripts/render_cell.sh "$CELL" | tee /tmp/render-result.json
+          # Validate JSON parses
+          python3 -c "import json; json.load(open('/tmp/render-result.json'))"
+
+      - name: Update sentinel state=ready
+        if: success()
+        run: |
+          bash scripts/sentinel.sh write "$CELL" ready --result /tmp/render-result.json
+
+      - name: Update sentinel state=failed
+        if: failure()
+        run: |
+          bash scripts/sentinel.sh write "$CELL" failed || true
+
+      - name: Print result summary
+        if: success()
+        run: |
+          cat /tmp/render-result.json
+          echo ""
+          KEY=$(python3 -c "import json; print(json.load(open('/tmp/render-result.json'))['key'])")
+          echo "::notice::Rendered $CELL -> https://tiles.argiants.tonoptik.com/$KEY"
