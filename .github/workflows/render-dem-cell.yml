@@ -88,9 +88,9 @@ jobs:
       - name: Render cell
         id: render
         run: |
-          bash scripts/render_cell.sh "$CELL" | tee /tmp/render-result.json
-          # Validate JSON parses
-          python3 -c "import json; json.load(open('/tmp/render-result.json'))"
+          bash scripts/render_cell.sh "$CELL" /tmp/render-result.json
+          # Validate JSON parses + echo for log visibility
+          python3 -c "import json; print(json.dumps(json.load(open('/tmp/render-result.json')), indent=2))"
 
       - name: Update sentinel state=ready
         if: success()

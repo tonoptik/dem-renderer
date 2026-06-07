@@ -5,6 +5,7 @@
 #
 # Inputs:
 #   $1 = cell name, e.g. N4225_E01850
+#   $2 = output JSON path (where result manifest is written)
 #
 # Env (must be present):
 #   R2_ACCESS_KEY_ID
@@ -33,6 +34,7 @@
 set -euo pipefail
 
 CELL="${1:?cell name required}"
+OUT_JSON="${2:?output JSON path required}"
 BUCKET="${R2_BUCKET:-argiants-tiles}"
 DEM_PREFIX="${R2_DEM_PREFIX:-dem}"
 
@@ -50,7 +52,7 @@ LAT_MAX=$(python3 -c "import json,sys; print(json.load(open('$META_JSON'))['bbox
 SRC_KEY=$(python3 -c "import json; print(json.load(open('$META_JSON'))['source_tile']['s3_key'])")
 SRC_FILENAME=$(python3 -c "import json; print(json.load(open('$META_JSON'))['source_tile']['filename'])")
 
-echo "[render] cell=$CELL bbox=[$LON_MIN,$LAT_MIN,$LON_MAX,$LAT_MAX] src=$SRC_KEY"
+echo "[render] cell=$CELL bbox=[$LON_MIN,$LAT_MIN,$LON_MAX,$LAT_MAX] src=$SRC_KEY" >&2
 
 # --- Step 2: download Copernicus 1 deg COG, anonymous S3 -------------------
 SRC_TIF="$WORK/src.tif"
@@ -88,7 +90,7 @@ pmtiles convert "$MBTILES" "$PMTILES_OUT"
 SHA=$(sha256sum "$PMTILES_OUT" | cut -c1-12)
 SIZE=$(stat -c%s "$PMTILES_OUT")
 KEY="$DEM_PREFIX/${CELL}-${SHA}.pmtiles"
-echo "[render] sha=$SHA size=${SIZE}B key=$KEY"
+echo "[render] sha=$SHA size=${SIZE}B key=$KEY" >&2
 
 # --- Step 8: rclone config + upload ----------------------------------------
 # rclone needs an in-process config; pass via env so we don't leak secrets to
@@ -110,8 +112,8 @@ rclone copyto \
   --s3-chunk-size=64M \
   "$PMTILES_OUT" "r2:$BUCKET/$KEY"
 
-# --- Step 9: stdout JSON result for workflow caller ------------------------
-cat <<EOF
+# --- Step 9: write JSON result for workflow caller --------------------------
+cat > "$OUT_JSON" <<EOF
 {
   "cell": "$CELL",
   "key": "$KEY",
@@ -125,3 +127,4 @@ cat <<EOF
   }
 }
 EOF
+echo "[render] result written to $OUT_JSON" >&2
